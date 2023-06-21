@@ -20,12 +20,10 @@ Functions are used on a per image basis
 
 import cv2
 import numpy as np
-import pandas as pd
 from skimage import measure
-from scipy.ndimage import convolve
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import convolve, label
 from scipy.ndimage import distance_transform_edt as dt_edt
-from skimage.morphology import skeletonize
+from skimage.morphology import skeletonize, thin
 
 def logical_minus(keep, *arrays):
     n = len(arrays)
@@ -46,16 +44,37 @@ def process(p):
 
     Returns
     -------
-    image : bool array
+    closing : bool array
         Binarized lattice image.
 
     '''
+    kernel = np.ones((5,5), np.uint8)
     gray = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
     blur = cv2.GaussianBlur(gray, (13,13),0)
     _, image = cv2.threshold(blur, np.mean(blur), 1, cv2.THRESH_BINARY)
     if np.sum(image) > image.size/2:
         image = np.logical_not(image)
-    return image
+    closing = cv2.morphologyEx(image.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+    return closing.astype(np.bool)
+
+def get_nodes(arr, c=1): 
+    idx = np.argwhere(arr)
+    top, left =  idx.min(axis=0)
+    bottom, right = idx.max(axis=0)
+    starts = [(left, top), (right, top),
+              (left, bottom), (right, bottom)]
+    k = 50
+    ends = [(left+k, top+k), (right-k, top+k),
+            (left+k, bottom-k), (right-k, bottom-k)]
+    for line in range(4):
+        arr = cv2.line(arr, starts[line], ends[line],
+                           c, 1) 
+        
+    kernel = np.ones((3,3))
+    kernel[1,1] = 9 # this means that the middle pixel is most weighted
+    nodes = convolve(arr, kernel, mode='constant') >= 12 
+    nodes = cv2.dilate(nodes.astype(np.uint8), np.ones((3,3)))
+    return nodes
 
 def segmentize(image):
     '''
@@ -75,13 +94,11 @@ def segmentize(image):
         skeleton minus the nodes - completely segmented struts of thickness 1.
 
     '''
-    sk = skeletonize(image).astype(np.uint8)
-    kernel = np.ones((3,3))
-    kernel[1,1] = 9 # this means that the middle pixel is most weighted
-    nodes = convolve(sk, kernel, mode='constant') >= 12 
-    nodes = cv2.dilate(nodes.astype(np.uint8), np.ones((3,3)))
-    segments = ((sk+1) - nodes)>1
-    return nodes.astype(np.bool), segments #, sk.astype(np.bool)
+    sk = skeletonize(image)
+    nodes = get_nodes(sk.astype(np.uint8))
+    sk = thin(sk)
+    seg = (((sk+1) - nodes)>1).astype(np.uint8)
+    return nodes.astype(np.bool), seg.astype(np.bool), sk.astype(np.bool)
 
 
 def expand_nodes(bit_nodes, k=15):
@@ -115,7 +132,7 @@ def expand_nodes(bit_nodes, k=15):
     #corners = dst > 0.001
     return dil_nodes
 
-def connectivity(segments, nodes, dil_nodes):
+def connectivity(segments, nodes, dil_nodes, return_map=False, return_all=False):
     '''
     Determine how many struts meet at a given node
 
@@ -135,8 +152,9 @@ def connectivity(segments, nodes, dil_nodes):
 
     '''
     # How many branches per region? 
-    #connect_map = dil_nodes.copy()   # Unsuppress for 
-    node_labels = measure.label(dil_nodes)
+    if return_map: 
+        connect_map = dil_nodes.copy()   # Unsuppress for 
+    _, node_labels = cv2.connectedComponents(dil_nodes.astype(np.uint8))
     node_props = measure.regionprops(node_labels, cache=True)
     c = []
     for r in node_props:
@@ -145,9 +163,15 @@ def connectivity(segments, nodes, dil_nodes):
         nono, _ = cv2.connectedComponents(nodes[x1:x2, y1:y2].astype(np.uint8))
         total = sgno - nono + 1
         c.append(total)
-        #connect_map[node_labels==r.label] = total
+        if return_map:  
+            connect_map[node_labels==r.label] = total
     node_connectivity = np.mean(c)
-    return node_connectivity
+    if return_map:
+        return node_connectivity, connect_map
+    elif return_all:
+        return c 
+    else:
+        return node_connectivity
         
     
 def thickness(im, nodes, sk):
@@ -157,7 +181,9 @@ def thickness(im, nodes, sk):
     return strut_thick, node_thick
 
 
-def color_by(labelled, reg, feat='area',  amin=0):
+
+
+def color_by(labelled, reg, feat='area', func=None, amin=0):
     '''
     Replaces labels with desired feature values
 
@@ -166,7 +192,7 @@ def color_by(labelled, reg, feat='area',  amin=0):
     labelled : int32 array
         result of measure.label.
     regions : pandas DataFrame
-        DataFrame from regionprops_table.
+        DataFrame from regionprops obj.
     feat : TYPE, optional
         DESCRIPTION. The default is 'area'.
 
@@ -177,12 +203,41 @@ def color_by(labelled, reg, feat='area',  amin=0):
 
     '''
     colored = np.zeros_like(labelled)
-    feat_list = []
-    for r in reg:
-        coords, f = r['coords'], r[feat]
-        colored[tuple(zip(*coords))] = f
-        feat_list.append(f)
+    feat_list=[]
+    if func is not None:
+        for r in reg:
+            coords = r['coords']
+            f = func(r)
+            colored[tuple(zip(*coords))] = f
+            feat_list.append(f)
+    else: # Use feature 
+        for r in reg:
+            coords, f = r['coords'], r[feat]
+            colored[tuple(zip(*coords))] = f
+            feat_list.append(f)        
+
     return colored, feat_list
+
+def length_thick(im, dt, d=15, listed=True):
+    _, label_im = cv2.connectedComponents(im.astype(np.uint8))
+    dil_im = cv2.dilate(label_im.astype(np.uint16), np.ones((d,d)))
+    ncc = np.amax(label_im)
+    z = np.zeros_like(im.astype(np.float32))
+    if listed:
+        feats = []
+        for comp in range(1, ncc+1):
+            mask = label_im==comp
+            length = measure.regionprops(1*mask)[0].major_axis_length
+            avg_thick = np.mean(dt[mask])
+            feats.append(length/avg_thick)
+        return feats
+    else:
+        for comp in range(1, ncc+1):
+            mask = label_im==comp
+            length = measure.regionprops(1*mask)[0].major_axis_length
+            avg_thick = np.mean(dt[mask])
+            z[dil_im==comp] = length/avg_thick
+        return z
 
 def shape_analyze(im, bg=0, minval=0, crit='area', table=False, xprops=[]):
     '''
@@ -209,8 +264,12 @@ def shape_analyze(im, bg=0, minval=0, crit='area', table=False, xprops=[]):
     '''
     props = ['label', 'area', 'orientation', 
              'minor_axis_length', 'major_axis_length'] + xprops
+    
+    if bg != 0: 
+        _, label_im = cv2.connectedComponents(np.logical_not(im).astype(np.uint8))
+    else:
+        _, label_im = cv2.connectedComponents(im.astype(np.uint8))
 
-    label_im = measure.label(im, background=bg)
     if bg != 0: #if characterizing negative space 
         label_im[np.where(label_im>=1)] -= 1 # Remove bg
     regions = measure.regionprops(label_im, cache=False)
@@ -229,31 +288,3 @@ def shape_analyze(im, bg=0, minval=0, crit='area', table=False, xprops=[]):
     #tab = pd.DataFrame(tab)
     return label_im, propout
     
-
-
-
-'''
-# Attempted to use watershed segmentation to isolate. 
-# Didn't work, but know knows if i'll ever want that again. 
-def segment_centroids(binary_image, segments):
-    struts = measure.label(segments)
-    tab = measure.regionprops_table(struts, 
-                                    properties = ['centroid'])
-    centroids = []
-    markers = np.zeros_like(binary_image).astype(np.uint16)
-    n=1
-    for n in range(len(tab['centroid-0'])):
-        c1, c2 = int(tab['centroid-0'][n]), int(tab['centroid-1'][n])
-        markers[c1, c2] = n
-        n+=1
-
-    return markers 
-from skimage.feature import peak_local_max
-from skimage.segmentation import watershed
-from scipy.ndimage import distance.... transform somethign or other. 
-dist = dt_edt(cell_im)
-loc_max = peak_local_max(dist, min_distance=51, labels=cell_im)
-markers = np.zeros_like(cell_im, dtype=np.uint8)
-markers[loc_max[:, 0], loc_max[:, 1]] = 1
-
-'''

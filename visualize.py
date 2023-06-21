@@ -8,21 +8,71 @@ Created on Mon Jun  5 13:47:34 2023
 
 import matplotlib.pyplot as plt
 from math  import sin, cos
+import pandas as pd
 from preprocess import *
 from matplotlib.colors import ListedColormap
 from seaborn import heatmap
 
-def color_struts(colored, title=None):
-    fig, ax = plt.subplots()
-    colored = cv2.dilate(colored.astype(np.float32), np.ones((15,15)))
-    mask = colored != 0
-    im1= ax.imshow(colored, cmap= 'coolwarm')
-    fig.colorbar(im1)
-    ax.imshow(np.ma.masked_array(colored, mask), cmap='binary_r', vmin=1, vmax=np.max(colored))
-    ax.axis('off')
-    if title is not None:
-        plt.suptitle(title)
+def multi_imshow(*arrays, layout=None, cbar=False, cmap='viridis'):
+    num_arrays = len(arrays)
+    
+    if layout is None:
+        layout = (1, num_arrays)
+    else:
+        layout = (layout[0], layout[1])
+    
+    fig, axes = plt.subplots(layout[0], layout[1])
+    
+    for i, ax in enumerate(axes.flat):
+        if i < num_arrays:
+            img = ax.imshow(arrays[i], cmap=cmap)
+            ax.axis('off')
+            
+    if cbar:
+        fig.colorbar(img, ax=ax)
+        
+    plt.tight_layout()
+    
     return fig
+
+
+def color_struts(colored, zmask=None, struts=True, isax=None, d=15, bounds=None, cellmask=None):
+
+    if isax is None:
+        fig, ax = plt.subplots()
+    else:
+        ax = isax
+        
+    if struts:
+        colored = cv2.dilate(colored.astype(np.float32), np.ones((d,d)))
+    
+    if zmask is None:   
+        mask = colored != 0 # Mask zero terms 
+    else:
+        mask = cv2.dilate(zmask.astype(np.uint8), np.ones((d,d)))
+        
+    if bounds is None:
+        vmin, vmax = np.min(colored), np.max(colored)
+    else:
+        vmin, vmax = bounds
+            
+    if isax is None:
+        im1 =ax.imshow(colored, cmap='coolwarm')
+        plt.colorbar(im1)
+    else:
+        im1= ax.imshow(colored, cmap= 'coolwarm', vmin=vmin, vmax=vmax)
+        
+    if cellmask is None:
+        ax.imshow(np.ma.masked_array(colored, mask), cmap='binary_r' )
+    else: 
+        ax.imshow(np.ma.masked_array(cellmask, mask), cmap='binary_r' )
+        
+    ax.set_yticks([]), ax.set_xticks([])
+    
+    if isax is None:
+        return fig
+    else:
+        return ax, im1
 
 def color_by_thickness(im, segments, minval=50):
     dt = dt_edt(im)
@@ -42,7 +92,7 @@ def pixel_represent(arr,annot=True, mask=None):
                    xticklabels=[], yticklabels=[], 
                    cbar=False, linewidths=1,
                    annot=annot)
-    if mask is not None:
+    if mask is not None and annot:
         for text, show_annot in zip(ax.texts, mask.ravel()):
             text.set_visible(show_annot)
             
@@ -77,30 +127,36 @@ def compare_thicknesses(cell_im, skim, node_im):
     df = 2*df.set_index('specimen')
     return df
 
-def discrete_cbar(image, colormaps='viridis'):
-    ticks = np.arange(np.amin(image), np.amax(image+1))
-
-    # Create a colormap by combining colors from existing colormaps
+def discrete_cbar(colormaps='hsv'):
+    #ticks = np.arange(np.amin(image), np.amax(image+1))
+    ticks = np.arange(2, 10)
     colors = []
     cmap = plt.get_cmap(colormaps)
     colors.extend(cmap(np.linspace(0, 1, len(ticks))))
     newcmap = ListedColormap(colors)
     return newcmap, ticks
 
-def node_connectivity_map(cell_im, c):
-    fig, ax = plt.subplots()
+def node_connectivity_map(cell_im, c, ax=None,bar=True):
+    if ax is None:
+        fig, ax = plt.subplots()
+        
     im1 = ax.imshow(cell_im, cmap='binary_r')
     ax.axis('off')
     ax.patch.set_edgecolor('black')  
     ax.patch.set_linewidth('1')  
 
     cmask = np.ma.masked_where(c==0, c)
-    custom, ticks = discrete_cbar(cmask)
-    im2 = ax.imshow(cmask, cmap=custom, alpha=0.6)
     
-    cbar = ax.figure.colorbar(im2, ax=ax, ticks=ticks)
-    cbar.ax.set_yticklabels(ticks)
-    return fig
+    custom, ticks = discrete_cbar()#cmask)
+    
+    im2 = ax.imshow(cmask, cmap=custom, vmin=3, vmax=10)
+    if bar:
+        cbar = ax.figure.colorbar(im2, ax=ax, ticks=ticks)
+        cbar.ax.set_yticklabels(ticks)
+    if ax is None:
+        return fig
+    else:
+        return ax, im2
 
 
 def see_nodes(cells, dnodes, nodes, segments):
